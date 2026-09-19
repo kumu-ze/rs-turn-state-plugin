@@ -1,0 +1,9 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font:15px system-ui;margin:24px;color:#17243b;background:#f6f8fb}button{padding:10px 16px;border:0;border-radius:8px;background:#4267cf;color:white}article{padding:16px;margin:12px 0;background:white;border-radius:12px}small{color:#596579}h1{font-size:24px}.warning{color:#8b5900}</style>
+<h1>Turn-State 插件</h1><p class="warning">迁移预览：支持旧票复用与请求保护，自动补票和探测尚未接入。</p><button id="refresh">刷新</button><p id="status" role="status"></p><div id="tickets"></div>
+<script>
+let serial=0,pending='',rows=[];
+function refresh(){pending=String(++serial);parent.postMessage({type:'rs-plugin-call',id:pending,method:'admin.panel',input:{}},'*')}
+function render(){const list=document.getElementById('tickets');list.replaceChildren();for(const row of rows){const card=document.createElement('article'),title=document.createElement('strong'),time=document.createElement('p');title.textContent=row.accountId+' · '+row.model;const seconds=Math.max(0,Math.ceil(row.expiresAt-Date.now()/1000));time.textContent=seconds?'本地剩余 '+Math.floor(seconds/60)+'分 '+String(seconds%60).padStart(2,'0')+'秒':'已到期';card.append(title,time);list.append(card)}}
+addEventListener('message',e=>{if(e.source!==parent||e.data?.type!=='rs-plugin-result'||e.data.id!==pending)return;pending='';if(e.data.error){document.getElementById('status').textContent='读取失败';return}rows=e.data.data.tickets;document.getElementById('status').textContent=rows.length+' 张导入票；实际使用时校验当前账号身份和策略。';render()});document.getElementById('refresh').onclick=refresh;setInterval(render,1000);refresh();
+</script></html>

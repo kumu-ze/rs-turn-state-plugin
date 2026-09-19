@@ -1,0 +1,41 @@
+use gateway_admin::ports::plugins::PluginOperations;
+use gateway_core::engine::extensions::{ExtensionRequest, RequestExtension};
+use gateway_host::plugins::{PluginConfig, PluginRegistry, install_package};
+use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// 仅在提供已构建插件包时运行；普通 CI 不依赖独立业务仓库。
+#[tokio::test]
+#[ignore = "requires RS_TURN_STATE_PACKAGE built from the independent plugin repository"]
+async fn installed_turn_state_plugin_reuses_only_matching_identity() {
+    let source = std::path::PathBuf::from(std::env::var_os("RS_TURN_STATE_PACKAGE").unwrap());
+    let installed = tempfile::tempdir().unwrap();
+    install_package(&source, installed.path()).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let state = format!("gAAAAA{}", "x".repeat(286));
+    std::fs::write(data.path().join("turn-state-tickets.json"), serde_json::to_vec(&json!({
+        "revision":1,
+        "settings":{"enabled":true,"inject":true,"requireTicket":true,
+            "plusProLength":292,"businessLength":332,"defaultLength":292,"models":["gpt-6-astra"],
+            "intervalSeconds":60,"ttlSeconds":3600,"refreshBeforeSeconds":600,
+            "accounts":{"acct_one":{"mode":"manual","targetLength":null}}},
+        "tickets":[{"account_id":"acct_one","auth_binding":"a".repeat(64),"model":"gpt-6-astra","state":state,"expires_at":now+300}]
+    })).unwrap()).unwrap();
+    let registry = PluginRegistry::start(vec![PluginConfig {
+        directory: installed.path().join("turn-state-0.1.0"), data_directory:data.path().into()
+    }]).await.unwrap();
+    let mut request = ExtensionRequest {
+        provider:"openai".into(),account_id:"acct_one".into(),model:"gpt-6-astra".into(),
+        credential_scope:"a".repeat(64),authentication_kind:"oauth".into(),plan_type:Some("plus".into()),account_eligible:true,
+    };
+    let decision=registry.before_send(request.clone()).await.unwrap();
+    assert!(!decision.deny);assert_eq!(decision.values["session_state"],state);
+    request.credential_scope="b".repeat(64);
+    let decision=registry.before_send(request).await.unwrap();assert!(decision.deny);assert!(decision.values.is_empty());
+    let panel=registry.invoke("turn-state","admin.panel",json!({})).await.unwrap().to_string();
+    assert!(!panel.contains("gAAAAA"));assert!(!panel.contains(&"a".repeat(64)));
+    assert!(registry.invoke("turn-state","admin.unsupported",json!({})).await.is_err());
+    assert!(registry.list().await[0].available);
+    registry.shutdown().await;
+}
