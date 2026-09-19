@@ -1,8 +1,11 @@
-pub mod settings;
+pub mod bridge;
+pub mod model;
 
+pub mod tickets;
+
+use model::TicketSettings;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use settings::{TicketMode, TicketSettings};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs,
@@ -15,6 +18,8 @@ pub const MAX_FRAME: usize = 1024 * 1024;
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Ticket {
     pub account_id: String,
+    #[serde(default)]
+    pub credential_revision: u64,
     #[serde(default)]
     pub auth_binding: Option<String>,
     pub model: String,
@@ -69,15 +74,6 @@ fn valid_state(state: &str, length: usize) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_-=".contains(&c))
 }
 
-fn gated_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    ["gpt-6", "gpt-5.6"].iter().any(|prefix| {
-        model
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-') || rest.starts_with('.'))
-    })
-}
-
 impl Store {
     pub fn load(path: &Path, now: u64) -> Result<Self, &'static str> {
         let file = fs::File::open(path).map_err(|_| "无法读取插件数据")?;
@@ -103,52 +99,6 @@ impl Store {
                 && valid_state(&t.state, t.state.len())
         });
         Ok(store)
-    }
-
-    pub fn decision(&self, context: &RequestContext, now: u64) -> Decision {
-        let mut result = Decision::default();
-        if context.provider != "openai"
-            || context.authentication_kind != "oauth"
-            || !self.settings.enabled
-        {
-            return result;
-        }
-        let target = self
-            .settings
-            .target_length(&context.account_id, context.plan_type.as_deref());
-        let ticket = if context.account_eligible
-            && self.settings.inject
-            && self.settings.models.contains(&context.model)
-            && self
-                .settings
-                .accounts
-                .get(&context.account_id)
-                .is_some_and(|p| p.mode != TicketMode::Off)
-        {
-            self.tickets.iter().find(|t| {
-                t.account_id == context.account_id
-                    && t.model == context.model
-                    && t.auth_binding.as_deref() == Some(context.credential_scope.as_str())
-                    && t.expires_at > now
-                    && valid_state(&t.state, target)
-            })
-        } else {
-            None
-        };
-        if let Some(ticket) = ticket {
-            result
-                .values
-                .insert("session_state".into(), ticket.state.clone());
-        }
-        result.deny =
-            self.settings.require_ticket && gated_model(&context.model) && ticket.is_none();
-        result
-    }
-
-    pub fn panel(&self, now: u64) -> Value {
-        json!({"revision":self.revision, "settings":self.settings, "probeSupported":false,
-            "tickets":self.tickets.iter().map(|t| json!({"accountId":t.account_id,"model":t.model,
-                "expiresAt":t.expires_at,"expired":t.expires_at <= now})).collect::<Vec<_>>()})
     }
 }
 
@@ -208,3 +158,5 @@ pub fn write_frame(output: &mut impl Write, value: &Value) -> Result<(), &'stati
         .and_then(|_| output.flush())
         .map_err(|_| "写入失败")
 }
+
+pub mod runtime;

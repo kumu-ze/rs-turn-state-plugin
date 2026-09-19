@@ -20,11 +20,12 @@ async fn installed_turn_state_plugin_reuses_only_matching_identity() {
             "plusProLength":292,"businessLength":332,"defaultLength":292,"models":["gpt-6-astra"],
             "intervalSeconds":60,"ttlSeconds":3600,"refreshBeforeSeconds":600,
             "accounts":{"acct_one":{"mode":"manual","targetLength":null}}},
-        "tickets":[{"account_id":"acct_one","auth_binding":"a".repeat(64),"model":"gpt-6-astra","state":state,"expires_at":now+300}]
+        "tickets":[{"account_id":"acct_one","credential_revision":1,"auth_binding":"a".repeat(64),"model":"gpt-6-astra","state":state,"expires_at":now+300}]
     })).unwrap()).unwrap();
     let registry = PluginRegistry::start(vec![PluginConfig {
-        directory: installed.path().join("turn-state-0.1.0"), data_directory:data.path().into()
+        directory: installed.path().join("turn-state-0.2.0"), data_directory:data.path().into()
     }]).await.unwrap();
+    registry.attach_services(std::sync::Arc::new(FixtureServices)).unwrap();
     let mut request = ExtensionRequest {
         provider:"openai".into(),account_id:"acct_one".into(),model:"gpt-6-astra".into(),
         credential_scope:"a".repeat(64),authentication_kind:"oauth".into(),plan_type:Some("plus".into()),account_eligible:true,
@@ -38,4 +39,10 @@ async fn installed_turn_state_plugin_reuses_only_matching_identity() {
     assert!(registry.invoke("turn-state","admin.unsupported",json!({})).await.is_err());
     assert!(registry.list().await[0].available);
     registry.shutdown().await;
+}
+
+struct FixtureServices;
+#[async_trait::async_trait]
+impl gateway_core::engine::extensions::ExtensionServices for FixtureServices {
+ async fn invoke(&self,_method:&str,_input:serde_json::Value)->Result<serde_json::Value,gateway_core::engine::extensions::ExtensionUnavailable>{Ok(json!([{"id":"acct_one","name":"Fixture","plan":"plus","eligible":true,"binding":"a".repeat(64),"revision":1,"authenticationKind":"oauth"}]))}
 }

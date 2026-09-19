@@ -1,6 +1,6 @@
 [package]
 name = "rs-turn-state-plugin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -8,6 +8,17 @@ publish = false
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+futures = "0.3"
+base64 = "0.23"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+hyper-util = { git = "https://github.com/hyperium/hyper-util", rev = "191b1acf0a6b18e807e4abf5a6d4a7c47979ecd6" }

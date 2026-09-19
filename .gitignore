@@ -1,3 +1,7 @@
 /target/
 /dist/
 /data/
+
+/frontend/node_modules/
+/frontend/dist/
+*.tsbuildinfo

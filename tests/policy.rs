@@ -1,17 +1,6 @@
-use rs_turn_state_plugin::settings::{TicketAccountPolicy, TicketMode};
-use rs_turn_state_plugin::{RequestContext, Store, Ticket, import, read_frame};
+use rs_turn_state_plugin::model::{TicketAccountPolicy, TicketMode};
+use rs_turn_state_plugin::{Store, Ticket, import, read_frame};
 
-fn context() -> RequestContext {
-    RequestContext {
-        provider: "openai".into(),
-        account_id: "acct_one".into(),
-        model: "gpt-6-astra".into(),
-        credential_scope: "a".repeat(64),
-        authentication_kind: "oauth".into(),
-        plan_type: Some("plus".into()),
-        account_eligible: true,
-    }
-}
 fn store() -> Store {
     let mut store = Store::default();
     store.settings.enabled = true;
@@ -26,43 +15,13 @@ fn store() -> Store {
     );
     store.tickets.push(Ticket {
         account_id: "acct_one".into(),
+        credential_revision:1,
         auth_binding: Some("a".repeat(64)),
         model: "gpt-6-astra".into(),
         state: format!("gAAAAA{}", "x".repeat(286)),
         expires_at: 2000,
     });
     store
-}
-#[test]
-fn identity_expiry_policy_and_model_isolation() {
-    let mut store = store();
-    let mut request = context();
-    assert!(store.settings.validate());
-    assert!(!store.decision(&request, 1000).deny);
-    assert_eq!(
-        store.decision(&request, 1000).values["session_state"].len(),
-        292
-    );
-    request.credential_scope = "b".repeat(64);
-    assert!(store.decision(&request, 1000).deny);
-    request = context();
-    assert!(store.decision(&request, 2000).deny);
-    request.plan_type = Some("business".into());
-    assert!(store.decision(&request, 1000).deny);
-    request = context();
-    request.account_id = "acct_other".into();
-    assert!(store.decision(&request, 1000).deny);
-    request = context();
-    request.authentication_kind = "api_key".into();
-    assert!(!store.decision(&request, 1000).deny);
-    request = context();
-    request.model = "gpt-60".into();
-    assert!(!store.decision(&request, 1000).deny);
-    request = context();
-    store.settings.accounts.get_mut("acct_one").unwrap().mode = TicketMode::Off;
-    assert!(store.decision(&request, 1000).deny);
-    store.settings.enabled = false;
-    assert!(!store.decision(&request, 1000).deny);
 }
 #[test]
 fn import_preserves_source_and_private_fields_but_never_overwrites() {
@@ -83,10 +42,6 @@ fn import_preserves_source_and_private_fields_but_never_overwrites() {
     assert_eq!(std::fs::read(&source).unwrap(), bytes);
     let loaded = Store::load(&dest, 1000).unwrap();
     assert_eq!(loaded.retained, store.retained);
-    let page = loaded.panel(1000).to_string();
-    assert!(!page.contains("fixture"));
-    assert!(!page.contains("gAAAAA"));
-    assert!(!page.contains(&"a".repeat(64)));
     assert!(import(&source, &dest, 1000).is_err());
 }
 #[test]
