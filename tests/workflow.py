@@ -11,7 +11,7 @@ class Host(http.server.BaseHTTPRequestHandler):
   if method=='accounts.list':result=[account]
   elif method=='accounts.get':result=account
   elif method=='responses.probe':
-   assert data['credentialScope']==account['binding'];result=[200,state,0,'fixture']
+   assert data['credentialScope']==account['binding'];time.sleep(.1);result=[200,state,0,'fixture']
   elif method=='network.exit':result='192.0.2.10'
   elif method=='proxies.resolve':result='http://fixture:secret@127.0.0.1:8080'
   elif method=='proxies.list':result={'items':[{'id':'saved','name':'Saved','endpoint':'http://127.0.0.1:8080','hasAuthentication':True}],'page':{'totalPages':1}}
@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory() as root:
   result=job('admin.probe',{'accountId':account['id'],'model':'gpt-6-astra'});assert result['matched'],result
   assert rpc('request.before_send',context())['values']['session_state']==state
   assert job('admin.exit',{'revision':panel['revision'],'proxyId':'0'})['ip']=='192.0.2.10'
-  panel=rpc('admin.panel');assert len(panel['logs'])==1;assert 'secret' not in json.dumps(panel);assert state not in json.dumps(panel)
+  panel=rpc('admin.panel');assert len(panel['logs'])==2;assert 'secret' not in json.dumps(panel);assert state not in json.dumps(panel)
   rpc('admin.clear_logs');assert rpc('admin.panel')['logs']==[]
   account['binding']='b'*64;assert rpc('request.before_send',context())['deny']
   rpc('admin.continuous',{'accountId':account['id'],'model':'gpt-6-astra','intervalSeconds':10})

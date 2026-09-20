@@ -3,7 +3,7 @@ import type { OutboundProxyRecord } from '@/api/modules/proxies'
 import type { TicketAccount, TicketMode, TicketPanel, TicketPolicy, TicketProxyInput, TicketSettings } from '@/api/modules/tickets'
 import { ChevronLeft, ChevronRight, Plus, Trash2 } from '@lucide/vue'
 import { useEventListener, useIntervalFn, useNow } from '@vueuse/core'
-import { computed, onMounted, ref, toRaw, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, toRaw, watch } from 'vue'
 import { getProxies } from '@/api/modules/proxies'
 import { clearTicketLogs, continuousTicket, getTicketPanel, probeTicket, sampleTicketExit, saveTicketSettings } from '@/api/modules/tickets'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -20,7 +20,13 @@ const panel = ref<TicketPanel | null>(null)
 const draft = ref<TicketSettings | null>(null)
 const draftRevision = ref(0)
 let generation = 0
-let polling = false
+const polling = ref(false)
+const dirty = ref(false)
+const saveError = ref('')
+const confirmDiscard = ref(false)
+let applying = false
+let editVersion = 0
+let saveTimer: ReturnType<typeof setTimeout> | undefined
 const loading = ref(false)
 const saving = ref(false)
 const probing = ref('')
@@ -34,10 +40,10 @@ watch(() => draft.value?.requireTicket, (enabled) => {
 const manualProxies = ref<Record<string, string>>({})
 const continuousIntervals = ref<Record<string, string>>({})
 const manualProxyOptions = computed(() => [
-  { label: '代理池轮换', value: 'pool' },
+  { label: '代理池（按入口并发）', value: 'pool' },
   ...(panel.value?.proxies ?? []).map(p => ({ label: `${p.name}${p.enabled ? '' : '（已禁用）'}`, value: p.id, disabled: !p.enabled })),
 ])
-watch(() => panel.value?.revision, () => {
+watch(() => JSON.stringify(panel.value?.proxies.map(p => [p.id, p.endpoint])), () => {
   manualProxies.value = {}
 })
 const proxy = ref('')
@@ -130,6 +136,9 @@ const readyCount = computed(() => panel.value?.accounts.reduce((n, a) => n + a.m
 const autoAccountCount = computed(() => Object.values(policies.value).filter(p => p.mode === 'auto').length)
 
 function accept(data: TicketPanel) {
+  applying = true
+  const oldRows = poolDraft.value
+
   lastStatusRefresh.value = Date.now() / 1000
   statusRefreshFailed.value = false
   panel.value = data
@@ -144,10 +153,39 @@ function accept(data: TicketPanel) {
   policies.value = Object.fromEntries(data.accounts.map(a => [a.id, { ...a.policy }]))
   customLengths.value = Object.fromEntries(data.accounts.map(a => [a.id, a.policy.targetLength?.toString() ?? '']))
   proxy.value = ''
-  poolDraft.value = (data.proxies ?? []).map(p => ({ ...p, key: ++proxyKey, url: '', enabled: p.enabled ?? true, concurrency: p.concurrency ?? 1 }))
+  poolDraft.value = (data.proxies ?? []).map(p => ({ ...p, key: oldRows.find(row => row.id === p.id)?.key ?? ++proxyKey, url: '', enabled: p.enabled ?? true, concurrency: p.concurrency ?? 1 }))
   clearProxy.value = false
+  dirty.value = false
+  saveError.value = ''
+  applying = false
+}
+function queueSave() {
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => void save(true), 800)
+}
+watch([draft, models, policies, customLengths, proxy, poolDraft, clearProxy], () => {
+  if (applying || !draft.value)
+    return
+  dirty.value = true
+  editVersion++
+  saveError.value = ''
+  queueSave()
+}, { deep: true, flush: 'sync' })
+onBeforeUnmount(() => clearTimeout(saveTimer))
+useEventListener(window, 'beforeunload', (event) => {
+  if (dirty.value || saving.value) {
+    event.preventDefault()
+    event.returnValue = ''
+  }
+})
+function reloadDraft() {
+  if (dirty.value)
+    confirmDiscard.value = true
+  else void load()
 }
 async function load() {
+  clearTimeout(saveTimer)
+  confirmDiscard.value = false
   generation += 1
   loading.value = true
   failure.value = ''
@@ -161,9 +199,23 @@ function setMode(id: string, value: string) {
   const old = policies.value[id]
   policies.value[id] = { mode: value as TicketMode, targetLength: old?.targetLength ?? null }
 }
-async function save() {
-  if (!draft.value || !panel.value)
+async function save(automatic = false) {
+  clearTimeout(saveTimer)
+  if (!draft.value || !panel.value || saving.value || loading.value || !dirty.value)
     return
+  if (automatic && clearProxy.value) {
+    saveError.value = '清空代理池需点击“立即保存”确认，其余草稿已保留。'
+    return
+  }
+  if (draftRevision.value !== panel.value.revision) {
+    saveError.value = '其他页面已更新策略。当前草稿已保留，请重载已保存策略后再修改。'
+    return
+  }
+  const invalid = (message: string) => {
+    saveError.value = message
+    if (!automatic)
+      toast.warning(message)
+  }
   const settings = structuredClone(toRaw(draft.value))
   settings.models = models.value.split(/[,，\s]+/).filter(Boolean)
   settings.accounts = Object.fromEntries(Object.entries(policies.value).map(([id, policy]) => [id, {
@@ -172,7 +224,7 @@ async function save() {
   }]))
   const lengths = [settings.plusProLength, settings.businessLength, settings.defaultLength, ...Object.values(settings.accounts).flatMap(p => p.targetLength === null ? [] : [p.targetLength])]
   if (lengths.some(n => !Number.isInteger(n) || n < 64 || n > 4096)) {
-    toast.warning('目标长度应为 64–4096 的整数')
+    invalid('目标长度应为 64–4096 的整数')
     return
   }
   const ranges: [number, number, number, string][] = [
@@ -184,41 +236,87 @@ async function save() {
   ]
   for (const [value, min, max, message] of ranges) {
     if (!Number.isInteger(value) || value < min || value > max) {
-      toast.warning(message)
+      invalid(message)
       return
     }
   }
   if (!settings.models.length || settings.models.length > 8 || new Set(settings.models).size !== settings.models.length || settings.models.some(model => !/^[\w.-]{1,128}$/.test(model))) {
-    toast.warning('请填写 1–8 个不重复的有效模型名称')
+    invalid('请填写 1–8 个不重复的有效模型名称')
     return
   }
   const proxyPool = proxy.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean)
   const proxies: TicketProxyInput[] = poolDraft.value.map(p => ({ id: p.id, name: p.name.trim(), url: p.url?.trim() || undefined, savedProxyId: p.savedProxyId, enabled: p.enabled ?? true, concurrency: p.concurrency ?? 1 }))
   proxies.push(...proxyPool.map((url, i) => ({ name: `代理 ${poolDraft.value.length + i + 1}`, url })))
   if (!clearProxy.value && proxies.length > 64) {
-    toast.warning('代理池最多 64 个代理')
+    invalid('代理池最多 64 个代理')
     return
   }
   if (!clearProxy.value && proxies.some(p => !p.name || (!p.id && !p.savedProxyId && !p.url))) {
-    toast.warning('请填写代理名称和新代理完整地址')
+    invalid('请填写代理名称和新代理完整地址')
     return
   }
   if (proxies.some(p => p.concurrency !== undefined && (!Number.isInteger(p.concurrency) || p.concurrency < 1 || p.concurrency > 3))) {
-    toast.warning('每个代理入口并发应为 1–3')
+    invalid('每个代理入口并发应为 1–3')
     return
   }
   if (settings.enabled && (clearProxy.value || !proxies.length)) {
-    toast.warning('启用打标需要配置代理池；清除代理池前请关闭打标')
+    invalid('启用打标需要配置代理池；清除代理池前请关闭打标')
     return
   }
+  const submittedVersion = editVersion
+  const sentRows = structuredClone(toRaw(poolDraft.value))
+  const sentBulk = proxy.value
+  const sentClear = clearProxy.value
   saving.value = true
   generation += 1
   try {
-    accept(await saveTicketSettings({ revision: draftRevision.value, settings, proxies: clearProxy.value ? [] : proxies }))
-    toast.success('策略已保存，仍符合规则的有效票已保留')
+    const result = await saveTicketSettings({ revision: draftRevision.value, settings, proxies: sentClear ? [] : proxies }, { silent: automatic })
+    if (submittedVersion === editVersion) {
+      accept(result)
+    }
+    else {
+      // 用户可以在保存途中继续输入；仅重定位已落盘代理的索引，不覆盖新草稿。
+      applying = true
+      panel.value = result
+      draftRevision.value = result.revision
+      for (const row of poolDraft.value) {
+        const index = sentRows.findIndex(sent => sent.key === row.key)
+        if (index < 0)
+          continue
+        const sent = sentRows[index]!
+        const saved = sentClear ? undefined : result.proxies[index]
+        row.id = saved?.id
+        if (saved) {
+          row.endpoint = saved.endpoint
+          row.hasAuthentication = saved.hasAuthentication
+          if (row.url === sent.url)
+            row.url = ''
+          if (row.savedProxyId === sent.savedProxyId)
+            row.savedProxyId = undefined
+        }
+      }
+      if (proxy.value === sentBulk)
+        proxy.value = ''
+      else if (proxy.value.startsWith(sentBulk))
+        proxy.value = proxy.value.slice(sentBulk.length)
+      for (const saved of sentClear ? [] : result.proxies.slice(sentRows.length))
+        poolDraft.value.push({ ...saved, key: ++proxyKey, url: '' })
+      if (sentClear)
+        clearProxy.value = false
+      applying = false
+    }
+    saveError.value = ''
+    if (!automatic)
+      toast.success('策略已保存，仍符合规则的有效票已保留')
   }
-  catch {}
-  finally { saving.value = false }
+  catch {
+    saveError.value = '保存失败，草稿已保留。请检查连接或重载已保存策略，再点击立即保存重试。'
+  }
+  finally {
+    saving.value = false
+    if (dirty.value && !saveError.value)
+      queueSave()
+  }
 }
 async function probe(account: TicketAccount, model: string) {
   generation += 1
@@ -285,7 +383,7 @@ async function continuous(account: TicketAccount, model: string, stop = false) {
     panel.value = await continuousTicket({ ...manualInput(account.id, model), intervalSeconds: stop ? null : interval })
     if (!stop)
       showLatestLogs()
-    toast.success(stop ? '持续打标已停止' : '已提交持续打标，命中后自动停止')
+    toast.success(stop ? '已停止新探测，在途请求收尾后释放并发' : '已提交持续打标，命中后自动停止')
   }
   catch {}
   finally { controlling.value = '' }
@@ -310,22 +408,24 @@ async function clearLogs() {
   finally { clearingLogs.value = false }
 }
 async function refreshStatus() {
-  if (loading.value || saving.value || probing.value || controlling.value || clearingLogs.value || !panel.value || polling || document.hidden)
+  if (loading.value || saving.value || controlling.value || clearingLogs.value || !panel.value || polling.value || document.hidden)
     return
-  polling = true
+  polling.value = true
   const started = generation
   try {
     const data = await getTicketPanel({ silent: true })
     if (started === generation) {
-      panel.value = data
+      if (!dirty.value && data.revision !== draftRevision.value)
+        accept(data)
+      else panel.value = data
       lastStatusRefresh.value = Date.now() / 1000
       statusRefreshFailed.value = false
     }
   }
   catch { statusRefreshFailed.value = true }
-  finally { polling = false }
+  finally { polling.value = false }
 }
-useIntervalFn(refreshStatus, computed(() => activeContinuous.value.length ? 3000 : 10000))
+useIntervalFn(refreshStatus, computed(() => activeContinuous.value.length || probing.value || panel.value?.settings.enabled ? 3000 : 5000))
 useEventListener(document, 'visibilitychange', () => {
   if (!document.hidden)
     void refreshStatus()
@@ -336,14 +436,17 @@ useEventListener(document, 'visibilitychange', () => {
   <div class="flex flex-col gap-6">
     <BasePageHeader title="打标管理" description="按账号管理 Turn-State 探测与复用">
       <template #actions>
-        <BaseButton :disabled="loading || saving || !!probing" @click="load">
-          刷新 / 重置草稿
+        <BaseButton :disabled="loading || saving || !!probing" @click="reloadDraft">
+          重载已保存策略
         </BaseButton>
-        <BaseButton variant="primary" :disabled="!draft || saving || !!probing" @click="save">
-          {{ saving ? '保存中…' : '保存策略' }}
+        <BaseButton variant="primary" :disabled="!dirty || saving || loading" @click="save(false)">
+          {{ saving ? '保存中…' : '立即保存' }}
         </BaseButton>
       </template>
     </BasePageHeader>
+    <p role="status" class="text-sm" :class="saveError ? 'text-cp-warning-text' : 'text-cp-text-secondary'">
+      {{ saveError || (saving ? '正在自动保存…' : dirty ? '有修改，停止输入后自动保存…' : '修改自动保存 · 状态自动刷新') }}
+    </p>
     <p v-if="failure" role="alert" class="text-cp-error-text">
       {{ failure }}
     </p>
@@ -377,7 +480,7 @@ useEventListener(document, 'visibilitychange', () => {
           {{ draft.requireTicket ? '本页 OAuth 账号的 6 / 5.6 系列需有效票才能转发；目标模型需加入下方列表。' : '未获票时维持原转发。' }}
         </p>
         <p v-if="draft.activityOnly && !autoAccountCount" class="mt-2 text-xs text-cp-warning-text">
-          当前账号未设为自动模式；请在下方选择需要自动补票的账号并保存。
+          当前账号未设为自动模式；请在下方选择需要自动补票的账号（修改自动保存）。
         </p>
         <details class="mt-4 rounded-lg bg-cp-fill-quaternary p-3">
           <summary class="cursor-pointer font-semibold">
@@ -404,51 +507,53 @@ useEventListener(document, 'visibilitychange', () => {
           <summary class="cursor-pointer font-semibold">
             代理与出口 · {{ panel.proxies.filter(p => p.enabled).length }} / {{ panel.proxyCount }} 已启用
           </summary>
-          <div class="mt-4">
-            <label class="flex flex-col gap-2" for="ticket-proxy">
-              <span>批量追加代理</span><textarea id="ticket-proxy" v-model="proxy" aria-label="批量追加代理" autocomplete="off" spellcheck="false" placeholder="每行一个完整代理地址" class="min-h-24 rounded-lg bg-cp-fill-tertiary p-3 font-mono text-sm" :disabled="clearProxy" />
-            </label>
-          </div>
-          <div class="mt-4 flex flex-wrap items-center gap-3">
-            <h3 class="font-semibold">
-              已保存 {{ panel.proxyCount }} 个代理
-            </h3>
-            <BaseSwitch v-model="draft.proxyPoolEnabled" label="启用打标代理池" show-label />
-            <BaseButton :disabled="clearProxy || poolDraft.length >= 64" title="新增代理" aria-label="新增代理" @click="addProxy">
-              <Plus :size="16" />
-            </BaseButton>
-            <BaseButton :disabled="importing" @click="loadSavedProxies">
-              {{ importing ? '读取中…' : '读取 RS 已有代理' }}
-            </BaseButton>
-            <BaseSelect v-if="savedProxies.length" v-model="selectedProxy" :options="savedProxyOptions" aria-label="选择已有代理" class="w-full sm:w-80" />
-            <BaseButton v-if="savedProxies.length" :disabled="!selectedProxy || clearProxy" @click="importProxy">
-              加入打标池
-            </BaseButton>
-          </div>
-          <div v-for="entry in poolDraft" :key="entry.key" class="mt-3 flex flex-wrap items-center gap-3">
-            <BaseSwitch v-model="entry.enabled" :label="`启用 ${entry.name || '代理'}`" :disabled="clearProxy" />
-            <BaseInput v-model="entry.name" aria-label="代理名称" class="w-full sm:w-44" :disabled="clearProxy" />
-            <span class="min-w-0 flex-1 break-all font-mono text-sm">{{ entry.endpoint || '新代理' }} · {{ entry.hasAuthentication ? '已保存认证' : '无已保存认证' }}</span>
-            <BaseInput v-if="!entry.savedProxyId" v-model="entry.url" :aria-label="`${entry.name} 代理地址`" type="password" autocomplete="new-password" :placeholder="entry.id !== undefined ? '留空保留地址及认证；输入完整 URL 替换' : 'socks5://用户名:密码@主机:端口'" class="w-full sm:w-80" :disabled="clearProxy" />
-            <span v-else class="text-sm text-cp-text-secondary">保存时导入认证</span>
-            <BaseSelect :model-value="String(entry.concurrency ?? 1)" :options="[{ label: '并发 1', value: '1' }, { label: '并发 2', value: '2' }, { label: '并发 3', value: '3' }]" :aria-label="`${entry.name} 并发数`" :disabled="clearProxy" class="w-28" @update:model-value="entry.concurrency = Number($event)" />
-            <BaseButton :aria-label="`检测 ${entry.name} 出口 IP`" :disabled="entry.id === undefined || !!samplingExit || saving || draftRevision !== panel.revision || !!entry.url?.trim()" @click="sampleExit(entry.id!)">
-              {{ samplingExit === entry.id ? '检测中…' : '检测出口 IP' }}
-            </BaseButton>
-            <span v-if="exitSamples.get(entry.id ?? '')" class="w-full text-xs text-cp-text-secondary">
-              出口采样：{{ exitSamples.get(entry.id ?? '')?.ip || exitSamples.get(entry.id ?? '')?.message }} · {{ time(exitSamples.get(entry.id ?? '')?.checkedAt) }}
-              {{ (exitSamples.get(entry.id ?? '')?.checkedAt ?? 0) + 600 <= clock.getTime() / 1000 ? '（采样已过期）' : '（独立连接，非本次打标确认）' }}
-            </span>
-            <BaseButton :aria-label="`移除 ${entry.name}`" title="移除代理" :disabled="clearProxy" @click="poolDraft = poolDraft.filter(p => p.key !== entry.key)">
-              <Trash2 :size="16" />
-            </BaseButton>
-          </div>
-          <div class="mt-4">
-            <p class="mb-3 text-sm text-cp-text-secondary">
-              暂停代理池或禁用单个入口会保留配置和已获有效票，已发出的探测会正常结束。并发按代理入口计算，整个服务最多同时 12 个探测。
-            </p>
-            <BaseSwitch v-model="clearProxy" label="清除已保存的代理（需同时关闭打标）" show-label />
-          </div>
+          <fieldset :disabled="saving">
+            <div class="mt-4">
+              <label class="flex flex-col gap-2" for="ticket-proxy">
+                <span>批量追加代理</span><textarea id="ticket-proxy" v-model="proxy" aria-label="批量追加代理" autocomplete="off" spellcheck="false" placeholder="每行一个完整代理地址" class="min-h-24 rounded-lg bg-cp-fill-tertiary p-3 font-mono text-sm" :disabled="clearProxy" />
+              </label>
+            </div>
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <h3 class="font-semibold">
+                已保存 {{ panel.proxyCount }} 个代理
+              </h3>
+              <BaseSwitch v-model="draft.proxyPoolEnabled" label="启用打标代理池" show-label />
+              <BaseButton :disabled="clearProxy || poolDraft.length >= 64" title="新增代理" aria-label="新增代理" @click="addProxy">
+                <Plus :size="16" />
+              </BaseButton>
+              <BaseButton :disabled="importing" @click="loadSavedProxies">
+                {{ importing ? '读取中…' : '读取 RS 已有代理' }}
+              </BaseButton>
+              <BaseSelect v-if="savedProxies.length" v-model="selectedProxy" :options="savedProxyOptions" aria-label="选择已有代理" class="w-full sm:w-80" />
+              <BaseButton v-if="savedProxies.length" :disabled="!selectedProxy || clearProxy" @click="importProxy">
+                加入打标池
+              </BaseButton>
+            </div>
+            <div v-for="entry in poolDraft" :key="entry.key" class="mt-3 flex flex-wrap items-center gap-3">
+              <BaseSwitch v-model="entry.enabled" :label="`启用 ${entry.name || '代理'}`" :disabled="clearProxy" />
+              <BaseInput v-model="entry.name" aria-label="代理名称" class="w-full sm:w-44" :disabled="clearProxy" />
+              <span class="min-w-0 flex-1 break-all font-mono text-sm">{{ entry.endpoint || '新代理' }} · {{ entry.hasAuthentication ? '已保存认证' : '无已保存认证' }}<span v-if="entry.id !== undefined" class="ml-2 inline-block tabular-nums">进行中 {{ panel.proxies.find(p => p.id === entry.id)?.inFlight ?? 0 }} / {{ entry.concurrency ?? 1 }}</span></span>
+              <BaseInput v-if="!entry.savedProxyId" v-model="entry.url" :aria-label="`${entry.name} 代理地址`" type="password" autocomplete="new-password" :placeholder="entry.id !== undefined ? '留空保留地址及认证；输入完整 URL 替换' : 'socks5://用户名:密码@主机:端口'" class="w-full sm:w-80" :disabled="clearProxy" />
+              <span v-else class="text-sm text-cp-text-secondary">保存时导入认证</span>
+              <BaseSelect :model-value="String(entry.concurrency ?? 1)" :options="[{ label: '并发 1', value: '1' }, { label: '并发 2', value: '2' }, { label: '并发 3', value: '3' }]" :aria-label="`${entry.name} 并发数`" :disabled="clearProxy" class="w-28" @update:model-value="entry.concurrency = Number($event)" />
+              <BaseButton :aria-label="`检测 ${entry.name} 出口 IP`" :disabled="entry.id === undefined || !!samplingExit || saving || draftRevision !== panel.revision || !!entry.url?.trim()" @click="sampleExit(entry.id!)">
+                {{ samplingExit === entry.id ? '检测中…' : '检测出口 IP' }}
+              </BaseButton>
+              <span v-if="exitSamples.get(entry.id ?? '')" class="w-full text-xs text-cp-text-secondary">
+                出口采样：{{ exitSamples.get(entry.id ?? '')?.ip || exitSamples.get(entry.id ?? '')?.message }} · {{ time(exitSamples.get(entry.id ?? '')?.checkedAt) }}
+                {{ (exitSamples.get(entry.id ?? '')?.checkedAt ?? 0) + 600 <= clock.getTime() / 1000 ? '（采样已过期）' : '（独立连接，非本次打标确认）' }}
+              </span>
+              <BaseButton :aria-label="`移除 ${entry.name}`" title="移除代理" :disabled="clearProxy" @click="poolDraft = poolDraft.filter(p => p.key !== entry.key)">
+                <Trash2 :size="16" />
+              </BaseButton>
+            </div>
+            <div class="mt-4">
+              <p class="mb-3 text-sm text-cp-text-secondary">
+                暂停代理池或禁用单个入口会保留配置和已获有效票，已发出的探测会正常结束。并发按代理入口计算，整个服务最多同时 12 个探测。
+              </p>
+              <BaseSwitch v-model="clearProxy" label="清除已保存的代理（需关闭打标并点击立即保存）" show-label />
+            </div>
+          </fieldset>
         </details>
       </BaseCard>
       <BaseCard class="p-5">
@@ -459,7 +564,7 @@ useEventListener(document, 'visibilitychange', () => {
           <BaseInput v-model="search" aria-label="搜索账号" placeholder="搜索账号、套餐或 ID" class="w-full sm:w-72" />
         </div>
         <p class="mb-4 text-sm text-cp-text-secondary">
-          模式变更需保存；持续模式按入口并发配置探测，命中后停止。后台检查：{{ time(panel.workerCheckedAt) }}。
+          模式变更自动保存；手动、持续与自动模式均按入口并发配置发送一批请求，持续模式命中后停止。后台检查：{{ time(panel.workerCheckedAt) }}。
         </p>
         <p v-if="!rows.length" class="py-8 text-center text-cp-text-secondary">
           暂无匹配的 OAuth 账号
@@ -514,16 +619,16 @@ useEventListener(document, 'visibilitychange', () => {
                   <BaseInput :model-value="status.continuous?.intervalSeconds.toString() ?? continuousIntervals[`${account.id}/${status.model}`] ?? '10'" :disabled="!!status.continuous" :aria-label="`${account.name} ${status.model} 持续间隔（秒）`" type="number" min="10" max="86400" class="w-28" @update:model-value="continuousIntervals[`${account.id}/${status.model}`] = String($event)" />
                 </div>
                 <p class="mt-1 text-xs text-cp-text-secondary">
-                  右侧为批次间隔（秒），默认 10。
+                  右侧为持续批次间隔（秒），默认 10。每批按入口并发数同时探测，最多 12 个请求。
                 </p>
                 <div class="mt-3 flex flex-wrap gap-2">
-                  <BaseButton :disabled="!!probing || saving || !!controlling || !!status.continuous || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
-                    {{ probing === `${account.id}/${status.model}` || status.busy ? '探测中…' : '手动打一张' }}
+                  <BaseButton :disabled="!!probing || saving || dirty || !!controlling || !!status.continuous || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || !!(status.manualRetryAt && status.manualRetryAt > clock.getTime() / 1000)" @click="probe(account, status.model)">
+                    {{ probing === `${account.id}/${status.model}` || status.busy ? '探测中…' : '手动打一批' }}
                   </BaseButton>
                   <BaseButton v-if="status.continuous" :disabled="!!controlling" @click="continuous(account, status.model, true)">
                     {{ controlling === `${account.id}/${status.model}` ? '停止中…' : '停止持续打标' }}
                   </BaseButton>
-                  <BaseButton v-else variant="primary" :disabled="!!probing || saving || !!controlling || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || ticketReady(status)" @click="continuous(account, status.model)">
+                  <BaseButton v-else variant="primary" :disabled="!!probing || saving || dirty || !!controlling || !panel.settings.enabled || !panel.settings.proxyPoolEnabled || !panel.proxies.some(p => p.enabled) || !account.eligible || account.policy.mode === 'off' || status.busy || ticketReady(status)" @click="continuous(account, status.model)">
                     持续打标
                   </BaseButton>
                 </div>
@@ -554,7 +659,7 @@ useEventListener(document, 'visibilitychange', () => {
           出口 IP 是独立连接采样，不是本次打标的出口证明；在代理设置中按需检测，缓存 10 分钟。
         </p>
         <p class="mt-2 text-xs text-cp-text-secondary" role="status">
-          {{ statusRefreshFailed ? '状态刷新失败，请点击刷新记录重试。' : `最近刷新：${time(lastStatusRefresh)}` }}
+          {{ statusRefreshFailed ? '状态刷新失败，正在自动重试；也可点击刷新记录。' : `最近刷新：${time(lastStatusRefresh)}` }}
           记录在每次探测完成后出现；等待间隔和退避期间不会新增记录。
         </p>
         <p v-for="job in activeContinuous" :key="`${job.account}/${job.model}`" class="mt-2 text-sm text-cp-text-secondary">
@@ -628,7 +733,7 @@ useEventListener(document, 'visibilitychange', () => {
               <tr v-for="log in visibleLogs" :key="log.id" :class="log.result.matched ? 'bg-cp-success-container/50' : 'odd:bg-cp-fill-quaternary'">
                 <td class="p-3 align-top">
                   {{ time(log.startedAt) }}<div class="mt-1 text-cp-text-secondary">
-                    {{ log.trigger === 'auto' ? '自动' : log.continuous ? '手动持续' : '手动单次' }}
+                    {{ log.trigger === 'auto' ? '自动' : log.continuous ? '手动持续' : '手动批次' }}
                   </div>
                 </td>
                 <td class="max-w-56 break-all p-3 align-top">
@@ -685,6 +790,9 @@ useEventListener(document, 'visibilitychange', () => {
           </BaseButton>
         </div>
       </section>
+      <BaseConfirmModal v-model="confirmDiscard" title="重载已保存策略" confirm-text="放弃草稿并重载" destructive @confirm="load">
+        当前未保存的修改将被丢弃。保存失败或冲突时可先复制需要保留的输入。
+      </BaseConfirmModal>
       <BaseConfirmModal v-model="confirmClearLogs" title="清理打标记录" confirm-text="确认清理" destructive :loading="clearingLogs" @confirm="clearLogs">
         清理全部历史记录及其统计，不可撤销。有效票、代理设置、退避和持续任务保持不变，之后完成的探测会生成新记录。
       </BaseConfirmModal>

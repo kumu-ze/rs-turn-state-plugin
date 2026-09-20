@@ -86,6 +86,7 @@ struct Observations {
     retry: BTreeMap<String, u64>,
     manual_retry: BTreeMap<String, u64>,
     busy: BTreeMap<(String, String), usize>,
+    batches: std::collections::BTreeSet<(String, String)>,
     proxy_busy: BTreeMap<String, usize>,
     proxy_cursor: usize,
     worker_checked_at: Option<u64>,
@@ -343,7 +344,7 @@ impl TicketService {
                                     && gated_model(model)
                                     && ticket.is_none(),
                                 last_result: o.last.get(&key).cloned(),
-                                busy: o.busy.contains_key(&key),
+                                busy: o.busy.contains_key(&key) || o.batches.contains(&key),
                                 retry_at: o.retry_at(id, d.settings.interval_seconds, false),
                                 manual_retry_at: o.retry_at(
                                     id,
@@ -863,9 +864,12 @@ impl TicketService {
                 .observations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if o.continuous.contains_key(&key) {
+            if o.continuous.contains_key(&key)
+                || o.batches.contains(&key)
+                || o.busy.contains_key(&key)
+            {
                 return Err(error(ProviderAdminErrorKind::Conflict)
-                    .with_public_message("持续打标已在运行，请先停止"));
+                    .with_public_message("该账号模型仍有探测在途，请等待收尾后再开始"));
             }
             if !model.ready {
                 if o.continuous.len() >= MAX_PROBE_CONCURRENCY {
@@ -900,36 +904,92 @@ impl TicketService {
         let jobs = runs.into_iter().map(|(key, run)| {
             let panel = &panel;
             async move {
-                let model = panel.accounts.iter().find(|a| a.id == key.0 && a.eligible && a.policy.mode != TicketMode::Off)
+                let model = panel
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == key.0 && a.eligible && a.policy.mode != TicketMode::Off)
                     .and_then(|a| a.models.iter().find(|m| m.model == key.1));
                 let (revision, proxy_index, proxy_available) = {
-                    let d = self.data.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let index = run.proxy.as_ref().and_then(|proxy| d.proxy_pool.iter().position(|p| p == proxy));
+                    let d = self
+                        .data
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let index = run
+                        .proxy
+                        .as_ref()
+                        .and_then(|proxy| d.proxy_pool.iter().position(|p| p == proxy));
                     let available = index.map_or_else(
-                        || run.proxy.is_none() && (0..d.proxy_pool.len()).any(|i| d.proxy_enabled.get(i).copied().unwrap_or(true)),
-                        |i| d.proxy_enabled.get(i).copied().unwrap_or(true));
+                        || {
+                            run.proxy.is_none()
+                                && (0..d.proxy_pool.len())
+                                    .any(|i| d.proxy_enabled.get(i).copied().unwrap_or(true))
+                        },
+                        |i| d.proxy_enabled.get(i).copied().unwrap_or(true),
+                    );
                     (d.revision, index, available)
                 };
-                let stop = !panel.settings.enabled || !panel.settings.proxy_pool_enabled || !proxy_available || model.is_none_or(|m| m.ready);
-                if !stop && (run.next_probe_at > now() || model.is_some_and(|m| m.busy || m.manual_retry_at.is_some_and(|t| t > now()))) { return; }
-                let outcome = if stop { None } else {
+                let stop = !panel.settings.enabled
+                    || !panel.settings.proxy_pool_enabled
+                    || !proxy_available
+                    || model.is_none_or(|m| m.ready);
+                if !stop
+                    && (run.next_probe_at > now()
+                        || model.is_some_and(|m| {
+                            m.busy || m.manual_retry_at.is_some_and(|t| t > now())
+                        }))
+                {
+                    return;
+                }
+                let outcome = if stop {
+                    None
+                } else {
                     tokio::select! {
                         () = context.cancelled() => return,
-                        () = run.cancellation.cancelled() => return,
-                        results = self.probe_continuous_batch(&key, revision, proxy_index) => Some(results),
+                        results = self.probe_batch(TicketProbe {
+                            account_id: key.0.clone(), model: key.1.clone(),
+                            proxy_id: proxy_index.map(|i| i.to_string()), revision: Some(revision),
+                        }, false, true, Some(&run.cancellation)) => Some(results),
                     }
                 };
-                let mut o = self.observations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !o.continuous.get(&key).is_some_and(|active| active.id == run.id) { return; }
+                let mut o = self
+                    .observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !o
+                    .continuous
+                    .get(&key)
+                    .is_some_and(|active| active.id == run.id)
+                {
+                    return;
+                }
                 let done = match &outcome {
                     None => true,
-                    Some(results) => results.iter().any(|r| r.as_ref().is_ok_and(|r| r.matched))
-                        || results.iter().any(|r| r.as_ref().is_err_and(|e| matches!(e.kind(), ProviderAdminErrorKind::Invalid | ProviderAdminErrorKind::Internal))),
+                    Some(results) => {
+                        results.iter().any(|r| r.as_ref().is_ok_and(|r| r.matched))
+                            || results.iter().any(|r| {
+                                r.as_ref().is_err_and(|e| {
+                                    matches!(
+                                        e.kind(),
+                                        ProviderAdminErrorKind::Invalid
+                                            | ProviderAdminErrorKind::Internal
+                                    )
+                                })
+                            })
+                    }
                 };
                 if done {
-                    if let Some(active) = o.continuous.remove(&key) { active.cancellation.cancel(); }
+                    if let Some(active) = o.continuous.remove(&key) {
+                        active.cancellation.cancel();
+                    }
                 } else if let Some(active) = o.continuous.get_mut(&key) {
-                    let delay = if outcome.as_ref().is_some_and(|rs| rs.iter().any(|r| r.as_ref().is_ok_and(|r| r.http_status == 0))) { 60 } else { 0 };
+                    let delay = if outcome.as_ref().is_some_and(|rs| {
+                        rs.iter()
+                            .any(|r| r.as_ref().is_ok_and(|r| r.http_status == 0))
+                    }) {
+                        60
+                    } else {
+                        0
+                    };
                     active.next_probe_at = now().saturating_add(active.interval_seconds.max(delay));
                 }
             }
@@ -938,24 +998,46 @@ impl TicketService {
         Ok(())
     }
 
-    async fn probe_continuous_batch(
+    async fn probe_batch(
         &self,
-        key: &(String, String),
-        revision: u64,
-        selected: Option<usize>,
+        input: TicketProbe,
+        automatic: bool,
+        continuous: bool,
+        cancellation: Option<&CancellationToken>,
     ) -> Vec<Result<TicketResult, ProviderAdminError>> {
-        let slots = {
+        let key = (input.account_id.clone(), input.model.clone());
+        let (slots, revision) = {
             let d = self
                 .data
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let o = self
+            let mut o = self
                 .observations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if o.busy.contains_key(key)
-                || o.retry_at(&key.0, d.settings.manual_interval_seconds, true)
-                    .is_some()
+            if input.revision.is_some_and(|r| r != d.revision) {
+                return vec![Err(error(ProviderAdminErrorKind::Conflict)
+                    .with_public_message("代理或策略已变化，请刷新后重试"))];
+            }
+            let selected = match input.proxy_id.as_deref() {
+                Some(id) => match id.parse::<usize>() {
+                    Ok(index)
+                        if index < d.proxy_pool.len() && input.revision == Some(d.revision) =>
+                    {
+                        Some(index)
+                    }
+                    _ => return vec![Err(error(ProviderAdminErrorKind::Invalid))],
+                },
+                None => None,
+            };
+            let interval = if automatic {
+                d.settings.interval_seconds
+            } else {
+                d.settings.manual_interval_seconds
+            };
+            if o.busy.contains_key(&key)
+                || o.batches.contains(&key)
+                || o.retry_at(&key.0, interval, !automatic).is_some()
             {
                 return vec![Err(error(ProviderAdminErrorKind::Conflict))];
             }
@@ -991,34 +1073,63 @@ impl TicketService {
                     }
                 }
             }
-            slots
+            if slots.is_empty() {
+                return vec![Err(error(ProviderAdminErrorKind::Conflict)
+                    .with_public_message("代理池已暂停、全部代理已禁用或并发已满"))];
+            }
+            o.batches.insert(key.clone());
+            (slots, d.revision)
         };
+        let _batch = BatchGuard {
+            observations: &self.observations,
+            key: key.clone(),
+        };
+        let completed =
+            cancellation.map_or_else(CancellationToken::new, CancellationToken::child_token);
         futures::future::join_all(slots.into_iter().map(|i| {
-            self.probe_on_proxy(
-                TicketProbe {
-                    account_id: key.0.clone(),
-                    model: key.1.clone(),
-                    proxy_id: Some(i.to_string()),
-                    revision: Some(revision),
-                },
-                false,
-                Some(i),
-                true,
-            )
+            let completed = &completed;
+            let key = &key;
+            async move {
+                let result = self
+                    .probe_on_proxy(
+                        TicketProbe {
+                            account_id: key.0.clone(),
+                            model: key.1.clone(),
+                            proxy_id: Some(i.to_string()),
+                            revision: Some(revision),
+                        },
+                        automatic,
+                        Some(i),
+                        continuous,
+                        completed,
+                    )
+                    .await;
+                if result.as_ref().is_ok_and(|r| r.matched) {
+                    completed.cancel();
+                }
+                result
+            }
         }))
         .await
     }
 
     pub async fn probe(&self, input: TicketProbe) -> Result<TicketResult, ProviderAdminError> {
-        self.probe_with_mode(input, false).await
-    }
-
-    async fn probe_with_mode(
-        &self,
-        input: TicketProbe,
-        automatic: bool,
-    ) -> Result<TicketResult, ProviderAdminError> {
-        self.probe_on_proxy(input, automatic, None, false).await
+        let results = self.probe_batch(input, false, false, None).await;
+        // 页面展示一条批次摘要，每个实际请求仍分别记入日志。
+        if let Some(result) = results
+            .iter()
+            .find_map(|r| r.as_ref().ok().filter(|r| r.matched))
+        {
+            return Ok(result.clone());
+        }
+        let mut fallback = Err(error(ProviderAdminErrorKind::Conflict));
+        for result in results {
+            match result {
+                Ok(result) => return Ok(result),
+                Err(error) => fallback = Err(error),
+            }
+        }
+        fallback
     }
 
     async fn probe_on_proxy(
@@ -1027,6 +1138,7 @@ impl TicketService {
         automatic: bool,
         forced_proxy: Option<usize>,
         continuous: bool,
+        completed: &CancellationToken,
     ) -> Result<TicketResult, ProviderAdminError> {
         let _permit = self
             .request_slot
@@ -1039,6 +1151,10 @@ impl TicketService {
             .await?
             .filter(eligible)
             .ok_or_else(|| error(ProviderAdminErrorKind::Invalid))?;
+        // 首个命中后，不再启动仍在等待账号快照的槽；已发请求继续记录并安全收尾。
+        if completed.is_cancelled() {
+            return Err(error(ProviderAdminErrorKind::Conflict));
+        }
         let snapshot = self
             .data
             .lock()
@@ -1085,24 +1201,8 @@ impl TicketService {
                 .observations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let interval = if automatic {
-                snapshot.settings.interval_seconds
-            } else {
-                snapshot.settings.manual_interval_seconds
-            };
-            // 持续批次在派发前统一检查冷却，不因同批先完成的一发阻止其余并发槽。
-            if !continuous
-                && o.retry_at(&input.account_id, interval, !automatic)
-                    .is_some()
-            {
-                return Err(error(ProviderAdminErrorKind::Conflict)
-                    .with_public_message("账号仍在探测间隔或上游错误退避中，请稍后重试"));
-            }
+            // 所有模式都在批次入口检查冷却。某一槽先完成不会压掉同批其余槽。
             let key = (input.account_id.clone(), input.model.clone());
-            if !automatic && !continuous && o.busy.contains_key(&key) {
-                return Err(error(ProviderAdminErrorKind::Conflict)
-                    .with_public_message("该账号模型已有探测正在执行"));
-            }
             let start = o.proxy_cursor;
             let index = (0..snapshot.proxy_pool.len())
                 .map(|offset| (start + offset) % snapshot.proxy_pool.len())
@@ -1287,6 +1387,19 @@ struct BusyGuard<'a> {
     key: (String, String),
     proxy: String,
 }
+struct BatchGuard<'a> {
+    observations: &'a Mutex<Observations>,
+    key: (String, String),
+}
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        self.observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .batches
+            .remove(&self.key);
+    }
+}
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
         let mut observations = self
@@ -1444,42 +1557,7 @@ impl TicketTask {
                     })
                     .expect("候选非空")
             };
-            // 同一账号模型按各入口配额并发尝试；达到全局上限后从轮换游标公平选择。
-            let snapshot = self
-                .0
-                .data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let start = self
-                .0
-                .observations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .proxy_cursor;
-            let mut slots = Vec::new();
-            for offset in 0..snapshot.proxy_pool.len() {
-                let index = (start + offset) % snapshot.proxy_pool.len();
-                if snapshot.proxy_enabled.get(index).copied().unwrap_or(true) {
-                    for _ in 0..snapshot.proxy_concurrency.get(index).copied().unwrap_or(1) {
-                        if slots.len() < MAX_PROBE_CONCURRENCY {
-                            slots.push(index);
-                        }
-                    }
-                }
-            }
-            let probes = futures::future::join_all(slots.into_iter().map(|index| {
-                self.0.probe_on_proxy(
-                    TicketProbe {
-                        account_id: input.account_id.clone(),
-                        model: input.model.clone(),
-                        ..Default::default()
-                    },
-                    true,
-                    Some(index),
-                    false,
-                )
-            }));
+            let probes = self.0.probe_batch(input, true, false, None);
             tokio::select! {
                 () = context.cancelled() => {},
                 results = probes => {

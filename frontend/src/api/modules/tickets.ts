@@ -61,8 +61,8 @@ export interface TicketPanel { revision: number, settings: TicketSettings, proxy
 export function getTicketPanel(options: RequestOptions = {}) {
   return request<TicketPanel>({ url: '/api/admin/tickets', ...options })
 }
-export function saveTicketSettings(data: unknown) {
-  return request<TicketPanel>({ url: '/api/admin/tickets', method: 'POST', data })
+export function saveTicketSettings(data: unknown, options: RequestOptions = {}) {
+  return request<TicketPanel>({ url: '/api/admin/tickets', method: 'POST', data, ...options })
 }
 export interface TicketProbeInput { accountId: string, model: string, proxyId?: string, revision?: number }
 export function probeTicket(data: TicketProbeInput) {

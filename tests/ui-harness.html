@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>Offline plugin UI fixture</title>
+<style>html,body,iframe{margin:0;width:100%;height:100%;border:0}</style>
+<iframe title="打标插件" sandbox="allow-scripts"></iframe>
+<script>
+const settings = { enabled:true,inject:true,proxyPoolEnabled:true,activityOnly:false,idleSeconds:120,requireTicket:false,plusProLength:292,businessLength:332,defaultLength:292,models:['gpt-6-astra'],intervalSeconds:60,manualIntervalSeconds:0,ttlSeconds:3600,refreshBeforeSeconds:600,accounts:{fixture:{mode:'manual',targetLength:null}} };
+window.fixture = {
+ delay:0,fail:false,reads:0,writes:[],
+ panel:{revision:1,settings,proxyConfigured:true,proxyCount:1,proxies:[{id:'0',name:'Fixture proxy',endpoint:'http://127.0.0.1:8000',hasAuthentication:false,enabled:true,concurrency:3,inFlight:0,exitSample:null}],accounts:[{id:'fixture',name:'Fixture account',plan:'plus',eligible:true,targetLength:292,policy:settings.accounts.fixture,models:[{model:'gpt-6-astra',ready:false,expiresAt:null,tokenIssuedAt:null,lastRequestedAt:null,autoPaused:false,blocked:false,lastResult:null,busy:false,retryAt:null,manualRetryAt:null,continuous:null}]}],logs:[],logLimit:1000,workerCheckedAt:null}
+};
+addEventListener('message', async event => {
+ if(event.source !== document.querySelector('iframe').contentWindow || event.data?.type !== 'rs-plugin-call') return;
+ const {id,method,input}=event.data, f=window.fixture;
+ let data,error;
+ if(method==='admin.panel'){f.reads++;data=structuredClone(f.panel);}
+ else if(method==='admin.update'){
+  f.writes.push(structuredClone(input));
+  await new Promise(resolve=>setTimeout(resolve,f.delay));
+  if(f.fail || input.revision!==f.panel.revision) error='fixture update rejected';
+  else {
+   f.panel.settings=input.settings;
+   f.panel.revision++;
+   f.panel.accounts[0].policy=input.settings.accounts.fixture;
+   f.panel.accounts[0].targetLength=input.settings.accounts.fixture.targetLength ?? input.settings.plusProLength;
+   f.panel.proxies=input.proxies.map((p,index)=>({id:String(index),name:p.name,endpoint:p.url||f.panel.proxies[Number(p.id)]?.endpoint||'http://127.0.0.1:8001',enabled:p.enabled??true,concurrency:p.concurrency??1,hasAuthentication:false,inFlight:0,exitSample:null}));
+   f.panel.proxyCount=f.panel.proxies.length;
+   data=structuredClone(f.panel);
+  }
+ }
+ else error='unexpected fixture method';
+ event.source.postMessage({type:'rs-plugin-result',id,data,error},'*');
+});
+document.querySelector('iframe').src='../src/page.html';
+</script>

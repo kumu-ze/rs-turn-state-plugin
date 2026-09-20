@@ -1,6 +1,16 @@
 # RS Turn-State 插件
 
-独立 Rust 进程插件，版本 0.2.1。业务源码提取自 kumu-ze/codex-proxy-rs 的 8ab9101f，保留 Apache-2.0 许可。无需依赖或编译 RS 内部 crate。
+独立 Rust 进程插件，版本 0.2.2。业务源码提取自 kumu-ze/codex-proxy-rs 的 8ab9101f，保留 Apache-2.0 许可。无需依赖或编译 RS 内部 crate。
+
+## 0.2.2 更新
+
+- 手动按钮改为“手动打一批”：代理池模式按所有启用入口的可用配额同时尝试；指定入口时只使用该入口。入口并发为 3 即最多同时 3 个真实请求，插件所有打标任务共享 12 个请求槽。多个名称指向同一入口时共用其中最小限额。
+- 自动、持续、手动共用批次调度；冷却在批次开始前检查一次，避免一发先完成后把同批其他槽拦掉。同一账号模型不能重复启动批次。达到全局限额后轮换游标选择入口。
+- 首个命中后不再启动尚未发出的槽；已在途请求继续记录。停止持续打标也会保留在途配额直到请求收尾，避免停止后立即启动导致真实并发超额。保存变更后的旧版本探测结果仍会被丢弃。
+- 修改停止 800 毫秒后自动保存；运行状态每 3 秒刷新，关闭打标时每 5 秒刷新，隐藏页面暂停轮询。刷新只更新状态，不覆盖未保存输入。保存途中继续修改策略会顺序保存；保存失败/版本冲突保留草稿并显示状态，不自动覆盖其他页面的新设置。
+- 保留“立即保存”“重载已保存策略”和“刷新记录”。重载有修改时需确认丢弃；清空整个代理池需点击“立即保存”。保存代理期间该编辑区域短暂禁用，避免索引与认证错配。
+
+这会改变手动探测的请求数量；如只需一次，请指定并发为 1 的单个入口。未完成的输入不会保存，离开页面前应看到“修改自动保存 · 状态自动刷新”。插件 iframe 关闭/宿主跳转时不能保证异步草稿提交成功。升级保留原数据格式，首次启动不会重置已有策略或开关。测试与风险见 [0.2.2 验证记录](docs/validation-0.2.2.md)。
 
 ## 功能
 
@@ -19,12 +29,12 @@
 1. 打开宿主「插件」→「从 URL 安装」。
 2. 粘贴下载地址：
 
-   `https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.1/rs-turn-state-0.2.1-linux-x64.tar.gz`
+   `https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.2/rs-turn-state-0.2.2-linux-x64.tar.gz`
 
-3. 可从 [SHA256SUMS](https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.1/SHA256SUMS) 获取校验值并填入。
+3. 可从 [SHA256SUMS](https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.2/SHA256SUMS) 获取校验值并填入。
 4. 安装完成后点击「启用」，左侧会出现「打标管理」。首次安装没有历史票或策略，自动打标默认关闭；先检查账号和代理，再配置业务策略。
 
-仓库与安装包公开下载，不需要 GitHub 登录。只安装可信原生代码，插件拥有宿主用户权限。完整发布说明与校验文件见 [v0.2.1](https://github.com/kumu-ze/rs-turn-state-plugin/releases/tag/v0.2.1)。
+仓库与安装包公开下载，不需要 GitHub 登录。只安装可信原生代码，插件拥有宿主用户权限。完整发布说明与校验文件见 [v0.2.2](https://github.com/kumu-ze/rs-turn-state-plugin/releases/tag/v0.2.2)。
 
 ## 从源码构建和安装
 
@@ -36,8 +46,8 @@ pnpm install --frozen-lockfile --config.auto-install-peers=false
 pnpm build
 cd ..
 cargo build --release --locked
-python3 scripts/package.py target/release/rs-turn-state-plugin dist/turn-state-0.2.1
-codex-proxy-rs plugin-install dist/turn-state-0.2.1 /path/to/plugins
+python3 scripts/package.py target/release/rs-turn-state-plugin dist/turn-state-0.2.2
+codex-proxy-rs plugin-install dist/turn-state-0.2.2 /path/to/plugins
 mkdir -p /path/to/plugin-data/turn-state
 ```
 
@@ -53,7 +63,7 @@ target/release/rs-turn-state-plugin import /path/to/backup/turn-state-tickets.js
 
 ```yaml
 plugins:
-  - directory: /path/to/plugins/turn-state-0.2.1
+  - directory: /path/to/plugins/turn-state-0.2.2
     data_directory: /path/to/plugin-data/turn-state
 ```
 
@@ -61,7 +71,7 @@ plugins:
 
 YAML 仅在宿主没有持久化注册表时导入；之后以界面状态为准。不要通过删 YAML 假定已经停用。不要同时运行旧内置打票和新插件的自动任务。卸载保留数据；旧 YAML 外部数据目录在 URL 重装时需手工迁移到新目录。回滚使用切换前的宿主与数据备份。
 
-URL 安装示例：`tar -czf turn-state-0.2.1-linux-x64.tar.gz -C dist/turn-state-0.2.1 .`，提供可直接下载的地址。使用 Release 附件的直接下载地址；GitHub 仓库页面或源码压缩包不能作为插件包安装。不要将账号、代理密码或运行数据放入包。
+URL 安装示例：`tar -czf turn-state-0.2.2-linux-x64.tar.gz -C dist/turn-state-0.2.2 .`，提供可直接下载的地址。使用 Release 附件的直接下载地址；GitHub 仓库页面或源码压缩包不能作为插件包安装。不要将账号、代理密码或运行数据放入包。
 
 本插件声明 request.openai 与 provider.openai，调用 accounts.list/get、responses.probe、network.exit、proxies.list/resolve。宿主保存 OAuth；原生插件会取得代理地址（可能含认证），业务 UI 只接收脱敏投影。它与 RS 共享系统用户权限，不是 OS 沙箱；仍需信任二进制来源。详见宿主的 docs/plugins.md 与 docs/plugins-validation.md。
 
@@ -71,6 +81,7 @@ URL 安装示例：`tar -czf turn-state-0.2.1-linux-x64.tar.gz -C dist/turn-stat
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 python3 tests/workflow.py target/release/rs-turn-state-plugin
+python3 tests/concurrency.py target/release/rs-turn-state-plugin
 ```
 
 workflow.py 使用真实插件进程及模拟宿主服务，覆盖保存、手动打票、身份变化拦截、代理导入、出口采样、日志清理、持续并发、按需自动和重启恢复，不访问生产账号。
