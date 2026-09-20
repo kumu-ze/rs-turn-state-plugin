@@ -1,6 +1,10 @@
 # RS Turn-State 插件
 
-独立 Rust 进程插件，版本 0.2.2。业务源码提取自 kumu-ze/codex-proxy-rs 的 8ab9101f，保留 Apache-2.0 许可。无需依赖或编译 RS 内部 crate。
+独立 Rust 进程插件，版本 0.2.3。业务源码提取自 kumu-ze/codex-proxy-rs 的 8ab9101f，保留 Apache-2.0 许可。无需依赖或编译 RS 内部 crate。
+
+## 0.2.3 元数据
+
+manifest 增加作者、公开仓库和 Release 附件模板，供宿主显示来源并检查更新；业务实现与 0.2.2 一致。新包需要识别这些字段的宿主（fork 3.12.1-plugin.6），数据格式不变。安装仍使用 tar.gz 附件直链。
 
 ## 0.2.2 更新
 
@@ -24,17 +28,17 @@
 
 ## 从 URL 安装
 
-适用于 Linux x86_64（glibc ≥ 2.34），需要宿主 fork **3.12.1-plugin.2 / API 1**。这是供验证的实验插件，不适用于官方未扩展的 RS。
+适用于 Linux x86_64（glibc ≥ 2.34），需要宿主 fork **3.12.1-plugin.6 / API 1**。这是供验证的实验插件，不适用于官方未扩展的 RS。
 
 1. 打开宿主「插件」→「从 URL 安装」。
 2. 粘贴下载地址：
 
-   `https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.2/rs-turn-state-0.2.2-linux-x64.tar.gz`
+   `https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.3/rs-turn-state-0.2.3-linux-x64.tar.gz`
 
-3. 可从 [SHA256SUMS](https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.2/SHA256SUMS) 获取校验值并填入。
+3. 可从 [SHA256SUMS](https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.3/SHA256SUMS) 获取校验值并填入。
 4. 安装完成后点击「启用」，左侧会出现「打标管理」。首次安装没有历史票或策略，自动打标默认关闭；先检查账号和代理，再配置业务策略。
 
-仓库与安装包公开下载，不需要 GitHub 登录。只安装可信原生代码，插件拥有宿主用户权限。完整发布说明与校验文件见 [v0.2.2](https://github.com/kumu-ze/rs-turn-state-plugin/releases/tag/v0.2.2)。
+仓库与安装包公开下载，不需要 GitHub 登录。只安装可信原生代码，插件拥有宿主用户权限。完整发布说明与校验文件见 [v0.2.2](https://github.com/kumu-ze/rs-turn-state-plugin/releases/tag/v0.2.3)。
 
 ## 从源码构建和安装
 
@@ -46,8 +50,8 @@ pnpm install --frozen-lockfile --config.auto-install-peers=false
 pnpm build
 cd ..
 cargo build --release --locked
-python3 scripts/package.py target/release/rs-turn-state-plugin dist/turn-state-0.2.2
-codex-proxy-rs plugin-install dist/turn-state-0.2.2 /path/to/plugins
+python3 scripts/package.py target/release/rs-turn-state-plugin dist/turn-state-0.2.3
+codex-proxy-rs plugin-install dist/turn-state-0.2.3 /path/to/plugins
 mkdir -p /path/to/plugin-data/turn-state
 ```
 
@@ -63,15 +67,15 @@ target/release/rs-turn-state-plugin import /path/to/backup/turn-state-tickets.js
 
 ```yaml
 plugins:
-  - directory: /path/to/plugins/turn-state-0.2.2
+  - directory: /path/to/plugins/turn-state-0.2.3
     data_directory: /path/to/plugin-data/turn-state
 ```
 
-适配宿主 fork **3.12.1-plugin.2 / API 1**。包声明 `menuLabel: 打标管理`，启用后可直接从左侧导航打开；页面仍在隔离 iframe 内运行。宿主「插件」页支持 URL 安装、启用、停用和卸载；新安装默认停用。业务页面“启用打标”与宿主进程开关是两个层级。
+适配宿主 fork **3.12.1-plugin.6 / API 1**。包声明 `menuLabel: 打标管理`，启用后可直接从左侧导航打开；页面仍在隔离 iframe 内运行。宿主「插件」页支持 URL 安装、启用、停用和卸载；新安装默认停用。业务页面“启用打标”与宿主进程开关是两个层级。
 
 YAML 仅在宿主没有持久化注册表时导入；之后以界面状态为准。不要通过删 YAML 假定已经停用。不要同时运行旧内置打票和新插件的自动任务。卸载保留数据；旧 YAML 外部数据目录在 URL 重装时需手工迁移到新目录。回滚使用切换前的宿主与数据备份。
 
-URL 安装示例：`tar -czf turn-state-0.2.2-linux-x64.tar.gz -C dist/turn-state-0.2.2 .`，提供可直接下载的地址。使用 Release 附件的直接下载地址；GitHub 仓库页面或源码压缩包不能作为插件包安装。不要将账号、代理密码或运行数据放入包。
+URL 安装示例：`tar -czf turn-state-0.2.3-linux-x64.tar.gz -C dist/turn-state-0.2.3 .`，提供可直接下载的地址。使用 Release 附件的直接下载地址；GitHub 仓库页面或源码压缩包不能作为插件包安装。不要将账号、代理密码或运行数据放入包。
 
 本插件声明 request.openai 与 provider.openai，调用 accounts.list/get、responses.probe、network.exit、proxies.list/resolve。宿主保存 OAuth；原生插件会取得代理地址（可能含认证），业务 UI 只接收脱敏投影。它与 RS 共享系统用户权限，不是 OS 沙箱；仍需信任二进制来源。详见宿主的 docs/plugins.md 与 docs/plugins-validation.md。
 
