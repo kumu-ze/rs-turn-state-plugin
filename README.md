@@ -12,7 +12,21 @@
 
 宿主提供账号快照、固定目标的 Provider 网络探测及代理读取；OAuth 凭据留在宿主。插件拥有打票策略、后台调度、票和日志数据。原生插件必须由管理员信任，并非操作系统沙箱。
 
-## 构建和安装
+## 从 URL 安装
+
+适用于 Linux x86_64（glibc ≥ 2.34），需要宿主 fork **3.12.1-plugin.2 / API 1**。这是供验证的实验插件，不适用于官方未扩展的 RS。
+
+1. 打开宿主「插件」→「从 URL 安装」。
+2. 粘贴下载地址：
+
+   `https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.1/rs-turn-state-0.2.1-linux-x64.tar.gz`
+
+3. 可从 [SHA256SUMS](https://github.com/kumu-ze/rs-turn-state-plugin/releases/download/v0.2.1/SHA256SUMS) 获取校验值并填入。
+4. 安装完成后点击「启用」，左侧会出现「打标管理」。首次安装没有历史票或策略，自动打标默认关闭；先检查账号和代理，再配置业务策略。
+
+仓库与安装包公开下载，不需要 GitHub 登录。只安装可信原生代码，插件拥有宿主用户权限。完整发布说明与校验文件见 [v0.2.1](https://github.com/kumu-ze/rs-turn-state-plugin/releases/tag/v0.2.1)。
+
+## 从源码构建和安装
 
 需要支持 provider.openai 能力的 codex/plugin-host 分支。旧的 0.1.0 宿主不具备完整插件服务接口。
 
@@ -47,7 +61,7 @@ plugins:
 
 YAML 仅在宿主没有持久化注册表时导入；之后以界面状态为准。不要通过删 YAML 假定已经停用。不要同时运行旧内置打票和新插件的自动任务。卸载保留数据；旧 YAML 外部数据目录在 URL 重装时需手工迁移到新目录。回滚使用切换前的宿主与数据备份。
 
-URL 安装示例：`tar -czf turn-state-0.2.1-linux-x64.tar.gz -C dist/turn-state-0.2.1 .`，提供可直接下载的地址。私有 GitHub 仓库链接不能匿名下载，请使用受控的临时直链或本地目录安装。不要将账号、代理密码或运行数据放入包。
+URL 安装示例：`tar -czf turn-state-0.2.1-linux-x64.tar.gz -C dist/turn-state-0.2.1 .`，提供可直接下载的地址。使用 Release 附件的直接下载地址；GitHub 仓库页面或源码压缩包不能作为插件包安装。不要将账号、代理密码或运行数据放入包。
 
 本插件声明 request.openai 与 provider.openai，调用 accounts.list/get、responses.probe、network.exit、proxies.list/resolve。宿主保存 OAuth；原生插件会取得代理地址（可能含认证），业务 UI 只接收脱敏投影。它与 RS 共享系统用户权限，不是 OS 沙箱；仍需信任二进制来源。详见宿主的 docs/plugins.md 与 docs/plugins-validation.md。
 
